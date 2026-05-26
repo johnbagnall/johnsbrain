@@ -1,0 +1,19 @@
+services:
+  app:
+    build: .
+    image: kanban-mcp:latest
+    container_name: kanban-mcp
+    restart: unless-stopped
+    ports:
+      - "3000:3000"
+    environment:
+      # Override these in a .env file alongside docker-compose.yml.
+      BETTER_AUTH_SECRET: "${BETTER_AUTH_SECRET}"
+      BETTER_AUTH_URL: "${BETTER_AUTH_URL:-http://localhost:3000}"
+      DATABASE_URL: "file:/data/app.db"
+      NODE_ENV: "production"
+    volumes:
+      - todo-data:/data
+
+volumes:
+  todo-data:
