@@ -1,9 +1,11 @@
 services:
   app:
-    build: .
-    image: kanban-mcp:latest
-    container_name: kanban-mcp
+    image: ghcr.io/johnbagnall/johnsbrain:latest
+    container_name: johnsbrain
     restart: unless-stopped
+    # Re-check GHCR for a newer image digest on every `docker compose up -d`.
+    # This is what makes "git pull && docker compose up -d" actually deploy.
+    pull_policy: always
     ports:
       - "3000:3000"
     environment:
