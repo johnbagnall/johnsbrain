@@ -7,7 +7,11 @@ services:
     # This is what makes "git pull && docker compose up -d" actually deploy.
     pull_policy: always
     ports:
-      - "3000:3000"
+      # Host port 80 → container port 3000, so the app is reachable at
+      # http://<host>/ rather than http://<host>:3000/. When TLS goes in
+      # front (Caddy etc), this changes to 127.0.0.1:3000:3000 and Caddy
+      # owns 80/443.
+      - "80:3000"
     environment:
       # Override these in a .env file alongside docker-compose.yml.
       BETTER_AUTH_SECRET: "${BETTER_AUTH_SECRET}"
