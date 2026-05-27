@@ -1,6 +1,7 @@
 "use client";
 import * as React from "react";
 import Link from "next/link";
+import Image from "next/image";
 import { useRouter } from "next/navigation";
 import { LogOut, Settings, User as UserIcon } from "lucide-react";
 import { toast } from "sonner";
@@ -27,8 +28,15 @@ export function AppHeader({ userName, userEmail }: { userName: string; userEmail
   const initial = (userName?.[0] || userEmail?.[0] || "?").toUpperCase();
   return (
     <header className="flex items-center justify-between px-4 h-14 border-b bg-background sticky top-0 z-30">
-      <Link href="/board" className="font-semibold">
-        John&apos;s Brain
+      <Link href="/board" aria-label="John's Brain — board">
+        <Image
+          src="/logo.png"
+          alt="John's Brain"
+          width={32}
+          height={32}
+          className="dark:invert"
+          priority
+        />
       </Link>
       <div className="flex items-center gap-1">
         <ThemeToggle />

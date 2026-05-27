@@ -1,4 +1,5 @@
 import Link from "next/link";
+import Image from "next/image";
 import { Button } from "@/components/ui/button";
 import { ThemeToggle } from "@/components/theme-toggle";
 
@@ -6,7 +7,14 @@ export default function Home() {
   return (
     <main className="flex-1 flex flex-col">
       <header className="flex items-center justify-between p-4 border-b">
-        <div className="font-semibold">John&apos;s Brain</div>
+        <Image
+          src="/logo.png"
+          alt="John's Brain"
+          width={36}
+          height={36}
+          className="dark:invert"
+          priority
+        />
         <div className="flex items-center gap-2">
           <ThemeToggle />
           <Button variant="ghost" asChild>
