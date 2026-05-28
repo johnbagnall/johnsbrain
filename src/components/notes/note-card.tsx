@@ -4,13 +4,12 @@ import { useSortable } from "@dnd-kit/sortable";
 import { CSS } from "@dnd-kit/utilities";
 import { GripVertical } from "lucide-react";
 import { formatDistanceToNow, format } from "date-fns";
-import ReactMarkdown from "react-markdown";
-import remarkGfm from "remark-gfm";
 import { cn } from "@/lib/utils";
 
 export interface NoteInput {
   id: string;
   streamId: string;
+  /** Legacy. New notes don't use this; the first line of `body` is the title. */
   title: string | null;
   body: string;
   position: number;
@@ -18,16 +17,27 @@ export interface NoteInput {
   updatedAt: string;
 }
 
+const MAX_TITLE_LEN = 80;
+
 /**
- * The display title for a note. Uses the explicit `title` when set, otherwise
- * falls back to the first four words of the body. Returns "Untitled" only when
- * both are empty.
+ * Display title for a note. First non-empty line of the body, truncated.
+ * Falls back to "Untitled" only if the body is completely empty.
  */
-export function noteTitle(n: Pick<NoteInput, "title" | "body">): string {
-  const explicit = (n.title ?? "").trim();
-  if (explicit) return explicit;
-  const words = n.body.trim().split(/\s+/).filter(Boolean).slice(0, 4);
-  return words.length ? words.join(" ") : "Untitled";
+export function noteTitle(n: { body: string }): string {
+  const line = n.body
+    .split("\n")
+    .map((l) => l.trim())
+    .find((l) => l.length > 0);
+  if (!line) return "Untitled";
+  return line.length > MAX_TITLE_LEN ? line.slice(0, MAX_TITLE_LEN).trimEnd() + "…" : line;
+}
+
+/** Everything after the first non-empty line, joined and trimmed. */
+export function noteExcerpt(body: string): string {
+  const lines = body.split("\n");
+  const firstNonEmpty = lines.findIndex((l) => l.trim().length > 0);
+  if (firstNonEmpty < 0) return "";
+  return lines.slice(firstNonEmpty + 1).join("\n").trim();
 }
 
 export function NoteCard({
@@ -54,7 +64,7 @@ export function NoteCard({
   const updatedAt = new Date(note.updatedAt);
   const wasEdited = updatedAt.getTime() - createdAt.getTime() > 1000;
   const heading = noteTitle(note);
-  const hasExplicitTitle = !!note.title?.trim();
+  const excerpt = noteExcerpt(note.body);
 
   return (
     <div
@@ -75,16 +85,13 @@ export function NoteCard({
       </button>
       <button
         onClick={onOpen}
-        aria-label={`Open note ${heading}`}
+        aria-label="Open note"
         className="flex h-full w-full flex-col text-left p-3 sm:p-4"
       >
-        <div className="text-sm font-medium leading-snug line-clamp-3 pr-7">{heading}</div>
-        {/* Show a body excerpt only when the title is explicit; otherwise the
-            heading already shows the first words of the body and the excerpt
-            would just repeat them. */}
-        {hasExplicitTitle && note.body.trim() ? (
-          <div className="prose-card text-xs text-muted-foreground mt-1 whitespace-pre-wrap break-words line-clamp-4">
-            <ReactMarkdown remarkPlugins={[remarkGfm]}>{note.body}</ReactMarkdown>
+        <div className="text-sm font-medium leading-snug line-clamp-2 pr-7">{heading}</div>
+        {excerpt ? (
+          <div className="text-xs text-muted-foreground mt-1 whitespace-pre-wrap break-words line-clamp-4">
+            {excerpt}
           </div>
         ) : null}
         <div

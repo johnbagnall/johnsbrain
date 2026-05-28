@@ -1,22 +1,18 @@
 "use client";
 import * as React from "react";
-import ReactMarkdown from "react-markdown";
-import remarkGfm from "remark-gfm";
-import { Pencil, Trash2 } from "lucide-react";
+import { Trash2 } from "lucide-react";
 import { toast } from "sonner";
+import { formatDistanceToNow } from "date-fns";
 import { createNoteAction, deleteNoteAction, updateNoteAction } from "@/lib/actions";
 import { Button } from "@/components/ui/button";
-import { Input } from "@/components/ui/input";
-import { Label } from "@/components/ui/label";
-import { AutoGrowTextarea } from "@/components/ui/auto-grow-textarea";
 import { Sheet, SheetContent, SheetDescription, SheetFooter, SheetHeader, SheetTitle } from "@/components/ui/sheet";
 import { useMediaQuery } from "@/components/use-media-query";
 import { noteTitle, type NoteInput } from "./note-card";
 
 interface Props {
-  /** The note being edited, or null when creating a new note. */
+  /** Null when creating a fresh note. */
   note: NoteInput | null;
-  /** Target stream for new notes (used only when `note` is null). */
+  /** Target stream for new notes. */
   createStreamId?: string;
   open: boolean;
   onOpenChange: (open: boolean) => void;
@@ -24,127 +20,172 @@ interface Props {
   onDeleted: (id: string) => void;
 }
 
-type Mode = "view" | "edit";
+type SaveState = "idle" | "pending" | "saving" | "saved" | "error";
+
+const SAVE_DEBOUNCE_MS = 800;
 
 export function NoteEditor({ note, createStreamId, open, onOpenChange, onSaved, onDeleted }: Props) {
   const isDesktop = useMediaQuery("(min-width: 640px)");
-  // Persisted = what's saved; draft = what the user is typing.
-  const [persistedTitle, setPersistedTitle] = React.useState<string | null>(null);
-  const [persistedBody, setPersistedBody] = React.useState("");
-  const [persistedId, setPersistedId] = React.useState<string | null>(null);
-  const [titleDraft, setTitleDraft] = React.useState("");
-  const [bodyDraft, setBodyDraft] = React.useState("");
-  const [mode, setMode] = React.useState<Mode>("edit");
-  const [pending, setPending] = React.useState(false);
+  const [body, setBody] = React.useState("");
+  const [saveState, setSaveState] = React.useState<SaveState>("idle");
+  const [savedAt, setSavedAt] = React.useState<Date | null>(null);
+  const [deleting, setDeleting] = React.useState(false);
 
+  // We track persisted state in refs so the debounced save can read fresh
+  // values without re-creating the timer on every keystroke.
+  const persistedIdRef = React.useRef<string | null>(null);
+  const persistedBodyRef = React.useRef("");
+  const latestBodyRef = React.useRef("");
+  const debounceRef = React.useRef<ReturnType<typeof setTimeout> | null>(null);
+  const isMountedRef = React.useRef(true);
+  const createStreamIdRef = React.useRef(createStreamId);
+  React.useEffect(() => {
+    createStreamIdRef.current = createStreamId;
+  }, [createStreamId]);
+
+  React.useEffect(
+    () => () => {
+      isMountedRef.current = false;
+      if (debounceRef.current) clearTimeout(debounceRef.current);
+    },
+    [],
+  );
+
+  // Tick once a minute so "saved 2m ago" stays fresh.
+  const [, forceRerender] = React.useState(0);
+  React.useEffect(() => {
+    if (!open) return;
+    const t = setInterval(() => forceRerender((n) => n + 1), 60_000);
+    return () => clearInterval(t);
+  }, [open]);
+
+  // Sync state when the editor opens on a (possibly new) note.
   React.useEffect(() => {
     if (!open) return;
     /* eslint-disable react-hooks/set-state-in-effect */
     if (note) {
-      setPersistedId(note.id);
-      setPersistedTitle(note.title);
-      setPersistedBody(note.body);
-      setTitleDraft(note.title ?? "");
-      setBodyDraft(note.body);
-      setMode("view");
+      persistedIdRef.current = note.id;
+      persistedBodyRef.current = note.body;
+      latestBodyRef.current = note.body;
+      setBody(note.body);
+      setSavedAt(new Date(note.updatedAt));
+      setSaveState("idle");
     } else {
-      setPersistedId(null);
-      setPersistedTitle(null);
-      setPersistedBody("");
-      setTitleDraft("");
-      setBodyDraft("");
-      setMode("edit");
+      persistedIdRef.current = null;
+      persistedBodyRef.current = "";
+      latestBodyRef.current = "";
+      setBody("");
+      setSavedAt(null);
+      setSaveState("idle");
     }
     /* eslint-enable react-hooks/set-state-in-effect */
   }, [open, note]);
 
-  const isCreate = persistedId === null;
-
-  async function onSave() {
-    const trimmedBody = bodyDraft.trim();
-    if (!trimmedBody) {
-      toast.error("Note can't be empty");
+  const persistNow = React.useCallback(async () => {
+    const current = latestBodyRef.current;
+    const id = persistedIdRef.current;
+    // No change since last persist? Nothing to do.
+    if (current === persistedBodyRef.current) {
+      if (isMountedRef.current) setSaveState("saved");
       return;
     }
-    const trimmedTitle = titleDraft.trim();
-    setPending(true);
+    // Don't materialize an empty brand-new note.
+    if (!current.trim() && id === null) {
+      if (isMountedRef.current) setSaveState("idle");
+      return;
+    }
+    if (isMountedRef.current) setSaveState("saving");
     try {
-      const saved = isCreate
-        ? await createNoteAction({
-            body: trimmedBody,
-            title: trimmedTitle || null,
-            streamId: createStreamId,
-          })
-        : await updateNoteAction({
-            id: persistedId!,
-            body: trimmedBody,
-            title: trimmedTitle || null,
-          });
-      onSaved({
+      const saved = id
+        ? await updateNoteAction({ id, body: current })
+        : await createNoteAction({ body: current, streamId: createStreamIdRef.current });
+
+      persistedIdRef.current = saved.id;
+      persistedBodyRef.current = saved.body;
+
+      const next: NoteInput = {
         id: saved.id,
-        streamId: saved.streamId ?? createStreamId ?? "",
-        title: saved.title,
+        streamId: saved.streamId ?? createStreamIdRef.current ?? "",
+        title: null,
         body: saved.body,
         position: saved.position,
         createdAt: saved.createdAt.toISOString(),
         updatedAt: saved.updatedAt.toISOString(),
-      });
-      setPersistedId(saved.id);
-      setPersistedTitle(saved.title);
-      setPersistedBody(saved.body);
-      setTitleDraft(saved.title ?? "");
-      setBodyDraft(saved.body);
-      setMode("view");
-      toast.success(isCreate ? "Note added" : "Note saved");
+      };
+      onSaved(next);
+
+      if (isMountedRef.current) {
+        setSavedAt(new Date(saved.updatedAt));
+        setSaveState("saved");
+      }
     } catch (err) {
-      toast.error(isCreate ? "Failed to add note" : "Failed to save note");
       console.error(err);
-    } finally {
-      setPending(false);
+      if (isMountedRef.current) setSaveState("error");
+      toast.error("Failed to save note");
     }
+  }, [onSaved]);
+
+  function scheduleSave() {
+    if (debounceRef.current) clearTimeout(debounceRef.current);
+    debounceRef.current = setTimeout(() => {
+      persistNow();
+    }, SAVE_DEBOUNCE_MS);
+  }
+
+  function onBodyChange(value: string) {
+    setBody(value);
+    latestBodyRef.current = value;
+    setSaveState("pending");
+    scheduleSave();
+  }
+
+  // Flush any pending edits before allowing the sheet to close.
+  function flushAndClose() {
+    if (debounceRef.current) {
+      clearTimeout(debounceRef.current);
+      debounceRef.current = null;
+    }
+    // Fire and forget; the save completes in the background even if the
+    // sheet has finished animating closed.
+    if (latestBodyRef.current !== persistedBodyRef.current) {
+      void persistNow();
+    }
+    onOpenChange(false);
+  }
+
+  function onSheetOpenChange(o: boolean) {
+    if (!o) flushAndClose();
+    else onOpenChange(o);
   }
 
   async function onDelete() {
-    if (isCreate || !persistedId) return;
+    const id = persistedIdRef.current;
+    if (!id) {
+      // Brand new + empty: just close.
+      onOpenChange(false);
+      return;
+    }
     if (!confirm("Delete this note?")) return;
-    setPending(true);
+    setDeleting(true);
     try {
-      await deleteNoteAction({ id: persistedId });
-      onDeleted(persistedId);
+      await deleteNoteAction({ id });
+      onDeleted(id);
       toast.success("Note deleted");
       onOpenChange(false);
     } catch (err) {
       toast.error("Failed to delete note");
       console.error(err);
     } finally {
-      setPending(false);
+      setDeleting(false);
     }
   }
 
-  function onKeyDown(e: React.KeyboardEvent<HTMLTextAreaElement>) {
-    if ((e.metaKey || e.ctrlKey) && e.key === "Enter") {
-      e.preventDefault();
-      onSave();
-    }
-  }
-
-  function onCancelEdit() {
-    if (isCreate) {
-      onOpenChange(false);
-      return;
-    }
-    setTitleDraft(persistedTitle ?? "");
-    setBodyDraft(persistedBody);
-    setMode("view");
-  }
-
-  const headerTitle = isCreate
-    ? "Add note"
-    : noteTitle({ title: persistedTitle, body: persistedBody });
-
+  const heading = noteTitle({ body });
+  const headingDisplay = heading === "Untitled" && !body.trim() ? "New note" : heading;
   const side = isDesktop ? "right" : "bottom";
+
   return (
-    <Sheet open={open} onOpenChange={onOpenChange}>
+    <Sheet open={open} onOpenChange={onSheetOpenChange}>
       <SheetContent
         side={side}
         className={
@@ -154,84 +195,56 @@ export function NoteEditor({ note, createStreamId, open, onOpenChange, onSaved, 
         }
       >
         <SheetHeader className="p-6 pb-4 border-b">
-          <SheetTitle className="text-xl leading-tight break-words">{headerTitle}</SheetTitle>
-          <SheetDescription className={mode === "view" ? "sr-only" : undefined}>
-            {mode === "view"
-              ? "Viewing note details."
-              : "Markdown supported in the body. ⌘/Ctrl + Enter to save."}
+          <div className="flex items-start justify-between gap-4">
+            <SheetTitle className="text-xl leading-tight break-words flex-1 min-w-0">
+              {headingDisplay}
+            </SheetTitle>
+            <SaveIndicator state={saveState} savedAt={savedAt} />
+          </div>
+          <SheetDescription className="sr-only">
+            Note editor. Changes auto-save shortly after you stop typing.
           </SheetDescription>
         </SheetHeader>
 
-        <div className="flex-1 overflow-y-auto p-6">
-          {mode === "view" ? (
-            <div className="prose-card text-sm whitespace-pre-wrap break-words">
-              {persistedBody.trim() ? (
-                <ReactMarkdown remarkPlugins={[remarkGfm]}>{persistedBody}</ReactMarkdown>
-              ) : (
-                <span className="text-muted-foreground">This note is empty.</span>
-              )}
-            </div>
-          ) : (
-            <div className="space-y-4">
-              <div className="space-y-2">
-                <Label htmlFor="note-title">Title (optional)</Label>
-                <Input
-                  id="note-title"
-                  value={titleDraft}
-                  onChange={(e) => setTitleDraft(e.target.value)}
-                  placeholder="Leave blank to use the first words of the body"
-                />
-              </div>
-              <div className="space-y-2">
-                <Label htmlFor="note-body">Body (markdown)</Label>
-                <AutoGrowTextarea
-                  id="note-body"
-                  autoFocus
-                  value={bodyDraft}
-                  onChange={(e) => setBodyDraft(e.target.value)}
-                  onKeyDown={onKeyDown}
-                  placeholder="Capture a thought…"
-                  minRows={10}
-                  maxRows={24}
-                  className="min-h-[200px]"
-                />
-              </div>
-            </div>
-          )}
+        <div className="flex-1 overflow-y-auto">
+          <textarea
+            autoFocus
+            value={body}
+            onChange={(e) => onBodyChange(e.target.value)}
+            placeholder="Start typing…"
+            className="w-full h-full min-h-[60vh] resize-none bg-transparent outline-none border-0 px-6 py-5 text-base leading-relaxed placeholder:text-muted-foreground/60"
+          />
         </div>
 
         <SheetFooter className="p-4 border-t bg-background">
-          {mode === "view" ? (
-            <div className="flex gap-2 w-full">
-              <Button variant="destructive" onClick={onDelete} disabled={pending} className="mr-auto">
-                <Trash2 className="h-4 w-4 mr-2" /> Delete
-              </Button>
-              <Button onClick={() => setMode("edit")} disabled={pending}>
-                <Pencil className="h-4 w-4 mr-2" /> Edit
-              </Button>
-            </div>
-          ) : (
-            <div className="flex gap-2 w-full">
-              {!isCreate ? (
-                <Button variant="destructive" onClick={onDelete} disabled={pending} className="mr-auto">
-                  <Trash2 className="h-4 w-4 mr-2" /> Delete
-                </Button>
-              ) : null}
-              <Button
-                variant="outline"
-                onClick={onCancelEdit}
-                disabled={pending}
-                className={isCreate ? "mr-auto" : ""}
-              >
-                Cancel
-              </Button>
-              <Button onClick={onSave} disabled={pending || !bodyDraft.trim()}>
-                {pending ? "Saving…" : isCreate ? "Add note" : "Save"}
-              </Button>
-            </div>
-          )}
+          <Button variant="destructive" onClick={onDelete} disabled={deleting} className="mr-auto">
+            <Trash2 className="h-4 w-4 mr-2" /> Delete
+          </Button>
+          <Button variant="outline" onClick={flushAndClose} disabled={deleting}>
+            Close
+          </Button>
         </SheetFooter>
       </SheetContent>
     </Sheet>
+  );
+}
+
+function SaveIndicator({ state, savedAt }: { state: SaveState; savedAt: Date | null }) {
+  let text = "";
+  if (state === "saving") text = "Saving…";
+  else if (state === "pending") text = "Unsaved";
+  else if (state === "error") text = "Failed to save";
+  else if (savedAt) text = `Saved ${formatDistanceToNow(savedAt, { addSuffix: true })}`;
+  if (!text) return null;
+  return (
+    <span
+      className={
+        state === "error"
+          ? "text-xs text-destructive shrink-0 pt-1"
+          : "text-xs text-muted-foreground shrink-0 pt-1"
+      }
+    >
+      {text}
+    </span>
   );
 }

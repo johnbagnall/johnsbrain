@@ -351,12 +351,37 @@ export async function getNotesData(userId: string) {
     });
   }
 
-  const notes = db
+  let notes = db
     .select()
     .from(schema.note)
     .where(eq(schema.note.userId, userId))
     .orderBy(asc(schema.note.position))
     .all();
+
+  // Lazy migration: notes used to have a separate `title` column. The editor
+  // is now a single canvas where the first line of `body` is the title.
+  // Fold any existing title into the body and null the column. Runs at most
+  // once per note: after the first call, the filter matches nothing.
+  const titled = notes.filter((n) => n.title && n.title.trim() !== "");
+  if (titled.length > 0) {
+    db.transaction((tx) => {
+      for (const n of titled) {
+        const t = n.title!.trim();
+        const newBody = n.body.trim() ? `${t}\n\n${n.body}` : t;
+        tx.update(schema.note)
+          .set({ body: newBody, title: null })
+          .where(eq(schema.note.id, n.id))
+          .run();
+      }
+    });
+    notes = db
+      .select()
+      .from(schema.note)
+      .where(eq(schema.note.userId, userId))
+      .orderBy(asc(schema.note.position))
+      .all();
+  }
+
   return { streams, notes };
 }
 
