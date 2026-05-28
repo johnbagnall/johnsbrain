@@ -1,78 +1,141 @@
 "use client";
 import * as React from "react";
-import ReactMarkdown from "react-markdown";
-import remarkGfm from "remark-gfm";
-import { Calendar, Pencil, Trash2 } from "lucide-react";
+import { Trash2 } from "lucide-react";
 import { toast } from "sonner";
-import { format } from "date-fns";
+import { formatDistanceToNow } from "date-fns";
 import { deleteCardAction, updateCardAction } from "@/lib/actions";
 import { Button } from "@/components/ui/button";
-import { Input } from "@/components/ui/input";
-import { AutoGrowTextarea } from "@/components/ui/auto-grow-textarea";
-import { Label } from "@/components/ui/label";
 import { Sheet, SheetContent, SheetDescription, SheetFooter, SheetHeader, SheetTitle } from "@/components/ui/sheet";
 import { useMediaQuery } from "@/components/use-media-query";
 import type { CardInput } from "./card-item";
-import type { ColumnInput } from "./column";
 
 interface Props {
   card: CardInput | null;
-  columns: ColumnInput[];
   open: boolean;
   onOpenChange: (open: boolean) => void;
   onUpdated: (card: CardInput) => void;
   onDeleted: (id: string) => void;
 }
 
-type Mode = "view" | "edit";
+type SaveState = "idle" | "pending" | "saving" | "saved" | "error";
 
-function toDateInputValue(iso: string | null): string {
-  if (!iso) return "";
-  try {
-    return format(new Date(iso), "yyyy-MM-dd");
-  } catch {
-    return "";
-  }
+const SAVE_DEBOUNCE_MS = 800;
+const MAX_TITLE_LEN = 80;
+
+/** title + (optional description) joined into a single canvas body. */
+function cardToBody(card: CardInput): string {
+  const title = card.title || "";
+  const desc = (card.description ?? "").trim();
+  return desc ? `${title}\n\n${desc}` : title;
 }
 
-export function CardEditor({ card, columns, open, onOpenChange, onUpdated, onDeleted }: Props) {
-  const isDesktop = useMediaQuery("(min-width: 640px)");
-  // "Persisted" mirrors the card prop so Cancel can revert without re-fetching.
-  const [persisted, setPersisted] = React.useState<CardInput | null>(null);
-  const [title, setTitle] = React.useState("");
-  const [description, setDescription] = React.useState("");
-  const [dueDate, setDueDate] = React.useState("");
-  const [mode, setMode] = React.useState<Mode>("view");
-  const [pending, setPending] = React.useState(false);
+/** First non-empty line of the body becomes the title; the rest is description. */
+function splitBody(body: string): { title: string; description: string | null } {
+  const lines = body.split("\n");
+  const firstNonEmpty = lines.findIndex((l) => l.trim().length > 0);
+  if (firstNonEmpty < 0) return { title: "", description: null };
+  const title = lines[firstNonEmpty].trim();
+  const rest = lines.slice(firstNonEmpty + 1).join("\n").trim();
+  return { title, description: rest || null };
+}
 
-  // Sync local state when the editor opens on a new card.
+function deriveHeaderTitle(body: string): string {
+  const { title } = splitBody(body);
+  if (!title) return "Card";
+  return title.length > MAX_TITLE_LEN ? title.slice(0, MAX_TITLE_LEN).trimEnd() + "…" : title;
+}
+
+export function CardEditor({ card, open, onOpenChange, onUpdated, onDeleted }: Props) {
+  const isDesktop = useMediaQuery("(min-width: 640px)");
+
+  const [body, setBody] = React.useState("");
+  const [saveState, setSaveState] = React.useState<SaveState>("idle");
+  const [savedAt, setSavedAt] = React.useState<Date | null>(null);
+  const [deleting, setDeleting] = React.useState(false);
+
+  const persistedIdRef = React.useRef<string | null>(null);
+  const persistedBodyRef = React.useRef("");
+  const latestBodyRef = React.useRef("");
+  const debounceRef = React.useRef<ReturnType<typeof setTimeout> | null>(null);
+  const isMountedRef = React.useRef(true);
+  const didInitForOpenRef = React.useRef(false);
+
+  React.useEffect(
+    () => () => {
+      isMountedRef.current = false;
+      if (debounceRef.current) clearTimeout(debounceRef.current);
+    },
+    [],
+  );
+
+  // Tick once a minute so "Saved 2m ago" stays fresh.
+  const [, forceRerender] = React.useState(0);
   React.useEffect(() => {
-    if (!open || !card) return;
+    if (!open) return;
+    const t = setInterval(() => forceRerender((n) => n + 1), 60_000);
+    return () => clearInterval(t);
+  }, [open]);
+
+  // Sync from `card` only on open or when truly switching cards. Same anti-
+  // clobber gate as the notes editor.
+  React.useEffect(() => {
+    if (!open) {
+      didInitForOpenRef.current = false;
+      persistedIdRef.current = null;
+      persistedBodyRef.current = "";
+      latestBodyRef.current = "";
+      return;
+    }
+    const incomingId = card?.id ?? null;
+    if (didInitForOpenRef.current) {
+      if (incomingId === persistedIdRef.current) return;
+    }
+    didInitForOpenRef.current = true;
     /* eslint-disable react-hooks/set-state-in-effect */
-    setPersisted(card);
-    setTitle(card.title);
-    setDescription(card.description ?? "");
-    setDueDate(toDateInputValue(card.dueDate));
-    setMode("view");
+    if (card) {
+      const b = cardToBody(card);
+      persistedIdRef.current = card.id;
+      persistedBodyRef.current = b;
+      latestBodyRef.current = b;
+      setBody(b);
+      setSavedAt(new Date());
+      setSaveState("idle");
+    } else {
+      persistedIdRef.current = null;
+      persistedBodyRef.current = "";
+      latestBodyRef.current = "";
+      setBody("");
+      setSavedAt(null);
+      setSaveState("idle");
+    }
     /* eslint-enable react-hooks/set-state-in-effect */
   }, [open, card]);
 
-  const columnName =
-    persisted ? columns.find((c) => c.id === persisted.columnId)?.name ?? null : null;
-
-  async function onSave() {
-    if (!persisted) return;
-    if (!title.trim()) {
-      toast.error("Title is required");
+  const persistNow = React.useCallback(async () => {
+    const id = persistedIdRef.current;
+    if (!id) return;
+    const current = latestBodyRef.current;
+    if (current === persistedBodyRef.current) {
+      if (isMountedRef.current) setSaveState("saved");
       return;
     }
-    setPending(true);
+    const { title, description } = splitBody(current);
+    if (!title) {
+      // Can't save a card with an empty title — keep as pending until the
+      // user types something. (Use Delete to remove the card.)
+      if (isMountedRef.current) setSaveState("pending");
+      return;
+    }
+    if (isMountedRef.current) setSaveState("saving");
     try {
-      const updated = await updateCardAction({
-        id: persisted.id,
-        title: title.trim(),
-        description: description.trim() ? description : null,
-        dueDate: dueDate || null,
+      const updated = await updateCardAction({ id, title, description });
+      persistedBodyRef.current = cardToBody({
+        id: updated.id,
+        columnId: updated.columnId,
+        title: updated.title,
+        description: updated.description,
+        dueDate: updated.dueDate ? new Date(updated.dueDate).toISOString() : null,
+        position: updated.position,
       });
       const next: CardInput = {
         id: updated.id,
@@ -83,105 +146,71 @@ export function CardEditor({ card, columns, open, onOpenChange, onUpdated, onDel
         position: updated.position,
       };
       onUpdated(next);
-      // Stay open; flip to view mode with the saved values.
-      setPersisted(next);
-      setTitle(next.title);
-      setDescription(next.description ?? "");
-      setDueDate(toDateInputValue(next.dueDate));
-      setMode("view");
-      toast.success("Saved");
+      if (isMountedRef.current) {
+        setSavedAt(new Date(updated.updatedAt));
+        setSaveState("saved");
+      }
     } catch (err) {
-      toast.error("Failed to save card");
       console.error(err);
-    } finally {
-      setPending(false);
+      if (isMountedRef.current) setSaveState("error");
+      toast.error("Failed to save card");
     }
+  }, [onUpdated]);
+
+  function scheduleSave() {
+    if (debounceRef.current) clearTimeout(debounceRef.current);
+    debounceRef.current = setTimeout(() => persistNow(), SAVE_DEBOUNCE_MS);
+  }
+
+  function onBodyChange(value: string) {
+    setBody(value);
+    latestBodyRef.current = value;
+    setSaveState("pending");
+    scheduleSave();
+  }
+
+  function flushAndClose() {
+    if (debounceRef.current) {
+      clearTimeout(debounceRef.current);
+      debounceRef.current = null;
+    }
+    if (latestBodyRef.current !== persistedBodyRef.current) {
+      void persistNow();
+    }
+    onOpenChange(false);
+  }
+
+  function onSheetOpenChange(o: boolean) {
+    if (!o) flushAndClose();
+    else onOpenChange(o);
   }
 
   async function onDelete() {
-    if (!persisted) return;
+    const id = persistedIdRef.current;
+    if (!id) {
+      onOpenChange(false);
+      return;
+    }
     if (!confirm("Delete this card?")) return;
-    setPending(true);
+    setDeleting(true);
     try {
-      await deleteCardAction({ id: persisted.id });
-      onDeleted(persisted.id);
+      await deleteCardAction({ id });
+      onDeleted(id);
       toast.success("Deleted");
       onOpenChange(false);
     } catch (err) {
       toast.error("Failed to delete card");
       console.error(err);
     } finally {
-      setPending(false);
+      setDeleting(false);
     }
   }
 
-  function onCancelEdit() {
-    if (!persisted) return;
-    // Discard draft, restore from persisted, return to view.
-    setTitle(persisted.title);
-    setDescription(persisted.description ?? "");
-    setDueDate(toDateInputValue(persisted.dueDate));
-    setMode("view");
-  }
-
-  const viewBody = (
-    <div className="space-y-4">
-      <div className="prose-card text-sm whitespace-pre-wrap break-words">
-        {persisted?.description && persisted.description.trim() ? (
-          <ReactMarkdown remarkPlugins={[remarkGfm]}>{persisted.description}</ReactMarkdown>
-        ) : (
-          <span className="text-muted-foreground">No description.</span>
-        )}
-      </div>
-      <div className="flex flex-wrap items-center gap-x-4 gap-y-1 text-xs text-muted-foreground pt-2 border-t">
-        <span>
-          In column: <span className="text-foreground">{columnName ?? "—"}</span>
-        </span>
-        {persisted?.dueDate ? (
-          <span className="inline-flex items-center gap-1">
-            <Calendar className="h-3 w-3" />
-            Due {format(new Date(persisted.dueDate), "MMM d, yyyy")}
-          </span>
-        ) : (
-          <span>No due date</span>
-        )}
-      </div>
-    </div>
-  );
-
-  const editBody = (
-    <div className="space-y-4">
-      <div className="space-y-2">
-        <Label htmlFor="card-title">Title</Label>
-        <Input id="card-title" value={title} onChange={(e) => setTitle(e.target.value)} />
-      </div>
-      <div className="space-y-2">
-        <Label htmlFor="card-desc">Description (markdown)</Label>
-        <AutoGrowTextarea
-          id="card-desc"
-          value={description}
-          onChange={(e) => setDescription(e.target.value)}
-          placeholder="Markdown supported — # heading, **bold**, [link](url), - lists, etc."
-          minRows={6}
-          maxRows={20}
-        />
-      </div>
-      <div className="space-y-2">
-        <Label htmlFor="card-due">Due date</Label>
-        <Input
-          id="card-due"
-          type="date"
-          value={dueDate}
-          onChange={(e) => setDueDate(e.target.value)}
-        />
-      </div>
-      <div className="text-xs text-muted-foreground">In column: {columnName ?? "—"}</div>
-    </div>
-  );
-
+  const headerTitle = deriveHeaderTitle(body);
   const side = isDesktop ? "right" : "bottom";
+
   return (
-    <Sheet open={open} onOpenChange={onOpenChange}>
+    <Sheet open={open} onOpenChange={onSheetOpenChange}>
       <SheetContent
         side={side}
         className={
@@ -191,45 +220,56 @@ export function CardEditor({ card, columns, open, onOpenChange, onUpdated, onDel
         }
       >
         <SheetHeader className="p-6 pb-4 border-b">
-          <SheetTitle className="text-xl leading-tight break-words">
-            {mode === "view" ? persisted?.title || "Card" : "Edit card"}
-          </SheetTitle>
-          <SheetDescription className={mode === "view" ? "sr-only" : undefined}>
-            {mode === "view"
-              ? "Viewing card details."
-              : "Update card details, description, and due date."}
+          <div className="flex items-start justify-between gap-4">
+            <SheetTitle className="text-xl leading-tight break-words flex-1 min-w-0">
+              {headerTitle}
+            </SheetTitle>
+            <SaveIndicator state={saveState} savedAt={savedAt} />
+          </div>
+          <SheetDescription className="sr-only">
+            Card editor. Changes auto-save shortly after you stop typing.
           </SheetDescription>
         </SheetHeader>
 
-        <div className="flex-1 overflow-y-auto p-6">
-          {mode === "view" ? viewBody : editBody}
+        <div className="flex-1 overflow-y-auto">
+          <textarea
+            autoFocus
+            value={body}
+            onChange={(e) => onBodyChange(e.target.value)}
+            placeholder="Start typing…"
+            className="w-full h-full min-h-[60vh] resize-none bg-transparent outline-none border-0 px-6 py-5 text-base leading-relaxed placeholder:text-muted-foreground/60"
+          />
         </div>
 
         <SheetFooter className="p-4 border-t bg-background">
-          {mode === "view" ? (
-            <div className="flex gap-2 w-full">
-              <Button variant="destructive" onClick={onDelete} disabled={pending} className="mr-auto">
-                <Trash2 className="h-4 w-4 mr-2" /> Delete
-              </Button>
-              <Button onClick={() => setMode("edit")} disabled={pending}>
-                <Pencil className="h-4 w-4 mr-2" /> Edit
-              </Button>
-            </div>
-          ) : (
-            <div className="flex gap-2 w-full">
-              <Button variant="destructive" onClick={onDelete} disabled={pending} className="mr-auto">
-                <Trash2 className="h-4 w-4 mr-2" /> Delete
-              </Button>
-              <Button variant="outline" onClick={onCancelEdit} disabled={pending}>
-                Cancel
-              </Button>
-              <Button onClick={onSave} disabled={pending}>
-                {pending ? "Saving…" : "Save"}
-              </Button>
-            </div>
-          )}
+          <Button variant="destructive" onClick={onDelete} disabled={deleting} className="mr-auto">
+            <Trash2 className="h-4 w-4 mr-2" /> Delete
+          </Button>
+          <Button variant="outline" onClick={flushAndClose} disabled={deleting}>
+            Close
+          </Button>
         </SheetFooter>
       </SheetContent>
     </Sheet>
+  );
+}
+
+function SaveIndicator({ state, savedAt }: { state: SaveState; savedAt: Date | null }) {
+  let text = "";
+  if (state === "saving") text = "Saving…";
+  else if (state === "pending") text = "Unsaved";
+  else if (state === "error") text = "Failed to save";
+  else if (savedAt) text = `Saved ${formatDistanceToNow(savedAt, { addSuffix: true })}`;
+  if (!text) return null;
+  return (
+    <span
+      className={
+        state === "error"
+          ? "text-xs text-destructive shrink-0 pt-1"
+          : "text-xs text-muted-foreground shrink-0 pt-1"
+      }
+    >
+      {text}
+    </span>
   );
 }

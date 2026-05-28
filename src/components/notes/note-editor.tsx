@@ -38,6 +38,10 @@ export function NoteEditor({ note, createStreamId, open, onOpenChange, onSaved, 
   const latestBodyRef = React.useRef("");
   const debounceRef = React.useRef<ReturnType<typeof setTimeout> | null>(null);
   const isMountedRef = React.useRef(true);
+  // True after we've initialised local state for the current open. Lets the
+  // sync effect distinguish "first open" from "parent re-rendered us with a
+  // fresher note prop because we just saved".
+  const didInitForOpenRef = React.useRef(false);
   const createStreamIdRef = React.useRef(createStreamId);
   React.useEffect(() => {
     createStreamIdRef.current = createStreamId;
@@ -59,9 +63,33 @@ export function NoteEditor({ note, createStreamId, open, onOpenChange, onSaved, 
     return () => clearInterval(t);
   }, [open]);
 
-  // Sync state when the editor opens on a (possibly new) note.
+  // Sync state when the editor opens on a (possibly new) note. After the
+  // first sync we don't reset from the `note` prop again: subsequent prop
+  // changes are usually our own save round-tripping through the parent, and
+  // re-syncing in that case would overwrite the characters the user just
+  // typed (the "backspace while typing" bug).
   React.useEffect(() => {
-    if (!open) return;
+    if (!open) {
+      // Reset bookkeeping so the next open is a clean init.
+      didInitForOpenRef.current = false;
+      persistedIdRef.current = null;
+      persistedBodyRef.current = "";
+      latestBodyRef.current = "";
+      return;
+    }
+    const incomingId = note?.id ?? null;
+    if (didInitForOpenRef.current) {
+      // Same note we're already tracking → parent just re-rendered after our
+      // own save. Skip; the user's in-flight edits stay.
+      if (incomingId === persistedIdRef.current) return;
+      // Parent is still in "create" mode (note=null) but we've already
+      // materialised the note locally after the first auto-save. Skip; we
+      // own the state until close.
+      if (incomingId === null && persistedIdRef.current !== null) return;
+      // Otherwise the parent has switched us to a different note — fall
+      // through and re-init.
+    }
+    didInitForOpenRef.current = true;
     /* eslint-disable react-hooks/set-state-in-effect */
     if (note) {
       persistedIdRef.current = note.id;

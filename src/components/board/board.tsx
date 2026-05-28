@@ -305,7 +305,6 @@ export function Board({ initialColumns, initialCards }: BoardProps) {
       ) : null}
       <CardEditor
         card={editingCard}
-        columns={columns}
         open={!!editingCard}
         onOpenChange={(open) => !open && setEditingCardId(null)}
         onUpdated={onCardUpdated}
